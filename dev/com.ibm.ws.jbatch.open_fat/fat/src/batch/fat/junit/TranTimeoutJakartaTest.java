@@ -89,5 +89,3 @@ public class TranTimeoutJakartaTest extends BatchFATHelper {
         test("TranTimeoutJakarta", "jslName=ChunkTranTimeoutJakarta&variation=3");
     }
 }
-
-// Made with Bob

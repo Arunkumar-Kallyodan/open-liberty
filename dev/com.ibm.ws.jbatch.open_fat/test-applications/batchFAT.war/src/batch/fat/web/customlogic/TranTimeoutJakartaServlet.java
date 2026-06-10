@@ -12,9 +12,6 @@
  *******************************************************************************/
 package batch.fat.web.customlogic;
 
-import static batch.fat.common.util.JobWaiter.COMPLETED_OR_FAILED_STATES;
-import static batch.fat.common.util.JobWaiter.STARTED_OR_STARTING;
-
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.List;
@@ -34,6 +31,8 @@ import javax.servlet.http.HttpServletResponse;
 
 import batch.fat.artifacts.EndOfJobNotificationListener;
 import batch.fat.common.util.JobWaiter;
+import static batch.fat.common.util.JobWaiter.COMPLETED_OR_FAILED_STATES;
+import static batch.fat.common.util.JobWaiter.STARTED_OR_STARTING;
 import batch.fat.util.BatchFATHelper;
 
 @WebServlet(name = "TranTimeoutJakarta", urlPatterns = { "/TranTimeoutJakarta" })
@@ -203,5 +202,3 @@ public class TranTimeoutJakartaServlet extends HttpServlet {
     }
 
 }
-
-// Made with Bob

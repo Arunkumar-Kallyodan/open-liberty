@@ -24,9 +24,11 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -41,6 +43,7 @@ import jakarta.data.constraint.In;
 import jakarta.data.constraint.Like;
 import jakarta.data.constraint.NotBetween;
 import jakarta.data.constraint.NotNull;
+import jakarta.data.exceptions.DataException;
 import jakarta.data.expression.TextExpression;
 import jakarta.data.page.CursoredPage;
 import jakarta.data.page.Page;
@@ -58,6 +61,7 @@ import jakarta.transaction.UserTransaction;
 
 import org.junit.Test;
 
+import componenttest.annotation.AllowedFFDC;
 import componenttest.app.FATServlet;
 import test.jakarta.data.v1_1.web.Fraction.Decimal;
 
@@ -100,6 +104,16 @@ public class Data_1_1_Servlet extends FATServlet {
                 fractionsToAdd.add(f);
             }
         fractions.supply(fractionsToAdd);
+    }
+
+    /**
+     * Indicates if testing with the Derby database.
+     *
+     * @return true if testing with the Derby database.
+     */
+    static final boolean isDerby() {
+        String jdbcJarName = System.getenv().getOrDefault("DB_DRIVER", "UNKNOWN");
+        return jdbcJarName.startsWith("derby");
     }
 
     /**
@@ -489,6 +503,29 @@ public class Data_1_1_Servlet extends FATServlet {
     }
 
     /**
+     * Use the QueryOptions annotation on a Find method to supply a load graph
+     * that overrides loading of an ElementCollection to make it eager rather
+     * than lazily loaded.
+     */
+    @Test
+    public void testEntityGraphAsQueryOption() {
+        assertEquals(List.of(BigDecimal.valueOf(300, 3), // nearest tenth
+                             BigDecimal.valueOf(310, 3), // nearest hundreth
+                             BigDecimal.valueOf(313, 3)), // nearest thousandth
+                     fractions.of(5, 16).orElseThrow().rounded);
+
+        assertEquals(List.of(BigDecimal.valueOf(900, 3), // nearest tenth
+                             BigDecimal.valueOf(860, 3), // nearest hundreth
+                             BigDecimal.valueOf(857, 3)), // nearest thousandth
+                     fractions.of(6, 7).orElseThrow().rounded);
+
+        assertEquals(List.of(BigDecimal.valueOf(600, 3), // nearest tenth
+                             BigDecimal.valueOf(620, 3), // nearest hundreth
+                             BigDecimal.valueOf(615, 3)), // nearest thousandth
+                     fractions.of(8, 13).orElseThrow().rounded);
+    }
+
+    /**
      * Tests a Find method with the First annotation specifying a value
      * larger than 1.
      */
@@ -851,6 +888,34 @@ public class Data_1_1_Servlet extends FATServlet {
     }
 
     /**
+     * Use a repository method that is annotated JakartaQuery that has
+     * both Restriction and Order parameters.
+     */
+    @Test
+    public void testJakartaQueryWithRestrictionAndOrder() {
+
+        Restriction<Fraction> ninthsAndTenths = //
+                        Restrict.any(_Fraction.denominator.equalTo(9),
+                                     _Fraction.denominator.equalTo(10));
+
+        assertEquals(List.of("One Ninth",
+                             "Two Ninths",
+                             "Two Tenths",
+                             "Three Ninths",
+                             "Three Tenths",
+                             "Four Ninths",
+                             "Four Tenths"),
+                     fractions.squareRootBetween(0.33,
+                                                 0.67,
+                                                 ninthsAndTenths,
+                                                 Order.by(_Fraction.numerator.asc(),
+                                                          _Fraction.denominator.asc()))
+                                     .stream()
+                                     .map(f -> f.name)
+                                     .toList());
+    }
+
+    /**
      * Supply LEFT and RIGHT expressions to a repository method.
      */
     @Test
@@ -987,6 +1052,82 @@ public class Data_1_1_Servlet extends FATServlet {
                      fractions.named(Like.pattern("T% _i_ths"),
                                      Order.by(Sort.desc(_Fraction.NAME)),
                                      Limit.of(4)));
+    }
+
+    /**
+     * Use the QueryOptions annotation to establish pessimistic locking and
+     * a query timeout on a repository method annotated JakartaQuery.
+     */
+    @AllowedFFDC("javax.transaction.xa.XAException") // due to query timeout
+    @Test
+    public void testLockModeAndQueryTimeoutAsQueryOptions() throws Exception {
+        // Populate with 18/23.
+        // Ensure deletion in the finally block.
+        fractions.supply(List.of(Fraction.of(18, 23)));
+
+        CountDownLatch locked = new CountDownLatch(1);
+        CountDownLatch blocked = new CountDownLatch(1);
+        CompletableFuture<Fraction> lockDB = CompletableFuture.supplyAsync(() -> {
+            try {
+                tx.setTransactionTimeout((int) TIMEOUT_S * 3);
+                tx.begin();
+                Optional<Fraction> found = //
+                                fractions.withWriteLock("Eighteen Twenty-thirds");
+                System.out.println("Obtained lock on 18/23");
+                locked.countDown();
+                blocked.await(TIMEOUT_S * 2, TimeUnit.SECONDS);
+                System.out.println("Release lock on 18/23");
+                tx.commit();
+                return found.orElseThrow();
+            } catch (RuntimeException x) {
+                throw x;
+            } catch (Exception x) {
+                throw new CompletionException(x);
+            }
+        });
+        try {
+            assertEquals(true, locked.await(TIMEOUT_S, TimeUnit.SECONDS));
+            // Derby ignores query timeout and the lock timeout ends up applying
+            // instead. Work around this by also setting the lock timeout when
+            // running on Derby:
+            if (isDerby())
+                if (isHibernatePersistence())
+                    statefulFractions.setLockTimeout(5);
+                else
+                    fractions.setLockTimeout(5);
+            tx.begin();
+            try {
+                Optional<Fraction> found = //
+                                fractions.withWriteLock("Eighteen Twenty-thirds");
+                fail("Query timeout on QueryOptions should have caused the" +
+                     " query to time out. Instead found " + found);
+            } catch (DataException x) {
+                // expected for query timeout
+            } finally {
+                tx.rollback();
+            }
+
+            blocked.countDown();
+            tx.begin();
+            Fraction f18_23 = fractions.withWriteLock("Eighteen Twenty-thirds")
+                            .orElseThrow();
+            assertEquals(0.7826,
+                         f18_23.decimal.value(),
+                         0.0001);
+            tx.commit();
+        } finally {
+            locked.countDown();
+            blocked.countDown();
+            // Ensure no fractions with denominator of 23 or more are left around
+            fractions.discard(AtLeast.min(23),
+                              AtMost.max(Integer.MAX_VALUE),
+                              Restrict.unrestricted());
+            if (isDerby())
+                if (isHibernatePersistence())
+                    statefulFractions.setLockTimeout(60);
+                else
+                    fractions.setLockTimeout(60);
+        }
     }
 
     /**

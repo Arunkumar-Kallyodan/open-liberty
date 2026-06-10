@@ -37,6 +37,7 @@ import java.util.stream.Stream;
 import com.ibm.websphere.ras.Tr;
 import com.ibm.websphere.ras.TraceComponent;
 import com.ibm.websphere.ras.annotation.Trivial;
+import com.ibm.ws.ffdc.annotation.FFDCIgnore;
 
 import io.openliberty.data.internal.AttributeConstraint;
 import io.openliberty.data.internal.QueryInfo;
@@ -81,8 +82,10 @@ import jakarta.data.metamodel.NavigableAttribute;
 import jakarta.data.repository.Delete;
 import jakarta.data.repository.Insert;
 import jakarta.data.repository.Is;
+import jakarta.data.repository.JakartaQuery;
 import jakarta.data.repository.OrderBy;
 import jakarta.data.repository.Query;
+import jakarta.data.repository.QueryOptions;
 import jakarta.data.repository.Save;
 import jakarta.data.repository.Update;
 import jakarta.data.repository.stateful.Detach;
@@ -103,8 +106,10 @@ import jakarta.data.spi.expression.function.TextFunctionExpression;
 import jakarta.data.spi.expression.literal.Literal;
 import jakarta.data.spi.expression.path.NavigablePath;
 import jakarta.data.spi.expression.path.Path;
-import jakarta.persistence.Entity;
+import jakarta.persistence.EntityGraph;
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.FlushModeType;
+import jakarta.persistence.QueryHint;
 import jakarta.persistence.TypedQuery;
 
 /**
@@ -367,44 +372,65 @@ public class QueryInfo_1_1 extends QueryInfo {
 
     @Override
     @Trivial
-    protected jakarta.persistence.Query ehCreateQuery(AutoCloseable entityHandler,
-                                                      String jpql) {
+    protected jakarta.persistence.Query ehCreateStatement(AutoCloseable entityHandler,
+                                                          String jpql) {
+        QueryOptions options = type.supportsQueryOptions //
+                        ? method.getAnnotation(QueryOptions.class) //
+                        : null;
+
         // TODO Persistence 4.0 API
         //return entityHandler instanceof EntityHandler handler //
-        //                ? handler.createQuery(jpql) //
-        //                : super.ehCreateQuery(entityHandler, jpql);
+        //                ? handler.createStatement(jpql) //
+        //                : ((EntityManager) entityHandler).createQuery(jpql);
         try {
-            return (jakarta.persistence.Query) entityHandler.getClass() //
-                            .getMethod("createQuery", String.class) //
-                            .invoke(entityHandler, jpql);
-        } catch (IllegalAccessException | //
-                        InvocationTargetException | //
-                        NoSuchMethodException x) {
+            jakarta.persistence.Query query = //
+                            (jakarta.persistence.Query) entityHandler.getClass() //
+                                            .getMethod("createQuery", String.class) //
+                                            .invoke(entityHandler, jpql);
+            if (options != null)
+                setWriteOptions(options, query);
+            return query;
+        } catch (IllegalAccessException | NoSuchMethodException x) {
             throw new RuntimeException(x); // should be impossible
+        } catch (InvocationTargetException x) {
+            if (x.getCause() instanceof RuntimeException rx)
+                throw rx;
+            throw new DataException(x.getCause());
         }
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     @Trivial
     protected <T> TypedQuery<T> ehCreateTypedQuery(AutoCloseable entityHandler,
                                                    String jpql,
                                                    Class<?> resultType) {
+        QueryOptions options = type.supportsQueryOptions //
+                        ? method.getAnnotation(QueryOptions.class) //
+                        : null;
+
         // TODO Persistence 4.0 API
-        //return entityHandler instanceof EntityHandler handler //
+        //TypedQuery<T> query = entityHandler instanceof EntityHandler handler //
         //                ? handler.createQuery(jpql, resultType) //
-        //                : super.ehCreateQuery(entityHandler, jpql, resultType);
+        //                : ((EntityManager) entityHandler) //
+        //                        .createQuery(jpql, resultType)
         try {
-            return (TypedQuery<T>) entityHandler.getClass() //
+            @SuppressWarnings("unchecked")
+            TypedQuery<T> query = (TypedQuery<T>) entityHandler.getClass() //
                             .getMethod("createQuery", String.class, Class.class) //
                             .invoke(entityHandler, jpql, resultType);
-        } catch (IllegalAccessException | //
-                        InvocationTargetException | //
-                        NoSuchMethodException x) {
+            if (options != null)
+                setReadOptions(options, query, entityHandler);
+            return query;
+        } catch (IllegalAccessException | NoSuchMethodException x) {
             throw new RuntimeException(x); // should be impossible
+        } catch (InvocationTargetException x) {
+            if (x.getCause() instanceof RuntimeException rx)
+                throw rx;
+            throw new DataException(x.getCause());
         }
     }
 
+    @FFDCIgnore(InvocationTargetException.class)
     @Override
     @Trivial
     protected void ehDelete(AutoCloseable entityHandler, Object entity) {
@@ -418,16 +444,19 @@ public class QueryInfo_1_1 extends QueryInfo {
         else
             try {
                 entityHandler.getClass() //
-                                .getMethod("delete", Entity.class) //
+                                .getMethod("delete", Object.class) //
                                 .invoke(entityHandler, entity);
             } catch (IllegalAccessException | NoSuchMethodException x) {
                 throw new RuntimeException(x); // should be impossible
             } catch (InvocationTargetException x) {
+                if (x.getCause() instanceof RuntimeException rx)
+                    throw rx;
                 throw new DataException(x.getCause());
             }
         // TODO deleteMultiple
     }
 
+    @FFDCIgnore(InvocationTargetException.class)
     @Override
     @Trivial
     protected void ehInsert(AutoCloseable entityHandler, Object entity) {
@@ -441,16 +470,19 @@ public class QueryInfo_1_1 extends QueryInfo {
         else
             try {
                 entityHandler.getClass() //
-                                .getMethod("insert", Entity.class) //
+                                .getMethod("insert", Object.class) //
                                 .invoke(entityHandler, entity);
             } catch (IllegalAccessException | NoSuchMethodException x) {
                 throw new RuntimeException(x); // should be impossible
             } catch (InvocationTargetException x) {
+                if (x.getCause() instanceof RuntimeException rx)
+                    throw rx;
                 throw new DataException(x.getCause());
             }
         // TODO insertMultiple
     }
 
+    @FFDCIgnore(InvocationTargetException.class)
     @Override
     @Trivial
     protected Object ehUpdate(AutoCloseable entityHandler, Object entity) {
@@ -464,18 +496,22 @@ public class QueryInfo_1_1 extends QueryInfo {
             updated = manager.merge(entity);
         else
             try {
-                updated = entityHandler.getClass() //
-                                .getMethod("update", Entity.class) //
+                entityHandler.getClass() //
+                                .getMethod("update", Object.class) //
                                 .invoke(entityHandler, entity);
+                updated = entity;
             } catch (IllegalAccessException | NoSuchMethodException x) {
                 throw new RuntimeException(x); // should be impossible
             } catch (InvocationTargetException x) {
+                if (x.getCause() instanceof RuntimeException rx)
+                    throw rx;
                 throw new DataException(x.getCause());
             }
         // TODO updateMultiple
         return updated;
     }
 
+    @FFDCIgnore(InvocationTargetException.class)
     @Override
     @Trivial
     protected Object ehUpsert(AutoCloseable entityHandler, Object entity) {
@@ -489,12 +525,15 @@ public class QueryInfo_1_1 extends QueryInfo {
             upserted = manager.merge(entity);
         else
             try {
-                upserted = entityHandler.getClass() //
-                                .getMethod("upsert", Entity.class) //
+                entityHandler.getClass() //
+                                .getMethod("upsert", Object.class) //
                                 .invoke(entityHandler, entity);
+                upserted = entity;
             } catch (IllegalAccessException | NoSuchMethodException x) {
                 throw new RuntimeException(x); // should be impossible
             } catch (InvocationTargetException x) {
+                if (x.getCause() instanceof RuntimeException rx)
+                    throw rx;
                 throw new DataException(x.getCause());
             }
         // TODO upsertMultiple
@@ -920,7 +959,9 @@ public class QueryInfo_1_1 extends QueryInfo {
     protected String getQueryAnnoValue() {
         if (methodTypeAnno instanceof Query query)
             return query.value();
-        // else TODO query annotation(s) from Jakarta Persistence
+        else if (methodTypeAnno instanceof JakartaQuery query)
+            return query.value();
+        // TODO NativeQuery?
         else
             return null;
     }
@@ -1051,6 +1092,89 @@ public class QueryInfo_1_1 extends QueryInfo {
         }
 
         return numJPQLParams;
+    }
+
+    /**
+     * Configures the query options that are intended for JPQL find/select queries.
+     *
+     * @param options       configurable query options
+     * @param query         the query upon which to configure the options
+     * @param entityHandler EntityAgent or EntityManager
+     */
+    private <T> void setReadOptions(QueryOptions options,
+                                    TypedQuery<T> query,
+                                    AutoCloseable entityHandler) //
+                    throws // TODO remove once using Persistence 4.0 API
+                    IllegalAccessException, //
+                    InvocationTargetException, //
+                    NoSuchMethodException {
+        // QueryOptions specified via Hints:
+        for (QueryHint hint : options.hints())
+            query.setHint(hint.name(),
+                          hint);
+        if (options.entityGraph().length() > 0) {
+            // TODO Persistence 4.0: entityHandler.getEntityGraph(options.entityGraph());
+            EntityGraph<?> loadGraph = (EntityGraph<?>) entityHandler.getClass() //
+                            .getMethod("getEntityGraph", String.class) //
+                            .invoke(entityHandler, options.entityGraph());
+            query.setHint("jakarta.persistence.loadgraph",
+                          loadGraph);
+        }
+
+        query.setHint("jakarta.persistence.lock.scope",
+                      options.lockScope());
+
+        // QueryOptions specified via dedicated API methods:
+        if (!entityInfo.isHibernate) {
+            // TODO enable for Hibernate once its NullPointerException is fixed
+            query.setCacheStoreMode(options.cacheStoreMode());
+            query.setCacheRetrieveMode(options.cacheRetrieveMode());
+        }
+        // TODO Persistence 4.0 directly delegate to setQueryFlushMode
+        switch (options.flush()) {
+            case DEFAULT:
+                break;
+            case FLUSH:
+                query.setFlushMode(FlushModeType.AUTO);
+                break;
+            case NO_FLUSH:
+                // TODO query.setQueryFlushMode(NO_FLUSH);
+                throw new UnsupportedOperationException("QueryFlushMode.NO_FLUSH");
+        }
+        query.setLockMode(options.lockMode());
+        // TODO the correct value is null, but Hibernate and EclipseLink do not handle it correctly
+        query.setTimeout(options.timeout() == -1 ? 0 : options.timeout());
+    }
+
+    /**
+     * Configures the query options that are intended for JPQL DELETE and UPDATE
+     * statements.
+     *
+     * @param options   configurable query options
+     * @param statement the jakarta.persistence.Statement upon which to configure
+     *                      the options
+     */
+    private static void setWriteOptions(QueryOptions options,
+                                        jakarta.persistence.Query statement) {
+        // QueryOptions specified via Hints:
+        for (QueryHint hint : options.hints())
+            statement.setHint(hint.name(),
+                              hint.value());
+
+        // QueryOptions specified via dedicated API methods:
+        // TODO Persistence 4.0 directly delegate to setQueryFlushMode
+        switch (options.flush()) {
+            case DEFAULT:
+                break;
+            case FLUSH:
+                statement.setFlushMode(FlushModeType.AUTO);
+                break;
+            case NO_FLUSH:
+                // TODO query.setQueryFlushMode(NO_FLUSH);
+                throw new UnsupportedOperationException("QueryFlushMode.NO_FLUSH");
+        }
+
+        statement.setTimeout(options.timeout() == -1 ? null : options.timeout());
     }
 
     /**

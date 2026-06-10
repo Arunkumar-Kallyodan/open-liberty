@@ -12,6 +12,9 @@
  *******************************************************************************/
 package test.jakarta.data.v1_1.web;
 
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -39,11 +42,14 @@ import jakarta.data.repository.Find;
 import jakarta.data.repository.First;
 import jakarta.data.repository.Insert;
 import jakarta.data.repository.Is;
+import jakarta.data.repository.JakartaQuery; // TODO replace with Persistence 4.0 anno once available
 import jakarta.data.repository.OrderBy;
 import jakarta.data.repository.Query;
+import jakarta.data.repository.QueryOptions; // TODO replace with Persistence 4.0 anno once available
 import jakarta.data.repository.Repository;
 import jakarta.data.repository.Select;
 import jakarta.data.restrict.Restriction;
+import jakarta.persistence.LockModeType;
 
 /**
  * Repository for the Fraction entity
@@ -57,6 +63,8 @@ public interface Fractions {
     List<Integer> atMost10Numerators(int denominator,
                                      Restriction<Fraction> filter,
                                      Order<Fraction> sortBy);
+
+    Connection connect();
 
     Long count(Restriction<Fraction> filter);
 
@@ -103,6 +111,17 @@ public interface Fractions {
                        Order<Fraction> order,
                        Limit limit);
 
+    @Find
+    @OrderBy(_Fraction.DENOMINATOR)
+    CursoredPage<Fraction> namedLike //
+    (@By(_Fraction.NAME) @Is(Like.class) String pattern,
+     Order<Fraction> additionalSorting,
+     PageRequest pageReq);
+
+    @Find
+    @QueryOptions(entityGraph = "EagerlyLoadRoundedValues")
+    Optional<Fraction> of(int numerator, int denominator);
+
     @Query("SELECT numerator, denominator - numerator" +
            " ORDER BY denominator - numerator DESC, numerator ASC")
     Page<Ratio> pageOfRatios(PageRequest pageReq);
@@ -111,20 +130,39 @@ public interface Fractions {
     List<Fraction> remove(Like name,
                           Restriction<Fraction> filter);
 
+    /**
+     * This is a workaround for Derby, which ignores query timeout
+     * and eventually the lock timeout (default 60s) applies instead.
+     * Tests can use this method to set the lock timeout to the desired
+     * query timeout value to make a query that involves a lock appear
+     * to time out as expected if the query timeout were honored.
+     */
+    default void setLockTimeout(int seconds) throws SQLException {
+        String sql = "CALL SYSCS_UTIL.SYSCS_SET_DATABASE_PROPERTY(?, ?)";
+        try (Connection con = connect()) {
+            CallableStatement cs = con.prepareCall(sql);
+            cs.setString(1, "derby.locks.waitTimeout");
+            cs.setInt(2, seconds);
+            cs.execute();
+        }
+    }
+
     @Query("SELECT NEW test.jakarta.data.v1_1.web.Ratio(" +
            "\t\tnumerator, denominator - numerator)" +
            "\tWHERE numerator=?1 AND denominator=?2")
     Optional<Ratio> singleRatio(int numerator, int denominator);
 
+    @JakartaQuery("""
+                     FROM Fraction f
+                    WHERE SQRT(f.decimal.value) BETWEEN ?1 AND ?2
+                    """)
+    List<Fraction> squareRootBetween(double min,
+                                     double max,
+                                     Restriction<Fraction> filter,
+                                     Order<Fraction> order);
+
     @Query("SELECT numerator, denominator - numerator")
     Stream<Ratio> streamOfRatios();
-
-    @Find
-    @OrderBy(_Fraction.DENOMINATOR)
-    CursoredPage<Fraction> namedLike //
-    (@By(_Fraction.NAME) @Is(Like.class) String pattern,
-     Order<Fraction> additionalSorting,
-     PageRequest pageReq);
 
     @Insert
     void supply(Collection<Fraction> list);
@@ -161,4 +199,10 @@ public interface Fractions {
     (@By(_Fraction.NUMERATOR) In<Integer> numerators,
      @Is int denominator,
      Sort<Fraction> sort);
+
+    @JakartaQuery("WHERE name = :name")
+    @QueryOptions(lockMode = LockModeType.PESSIMISTIC_WRITE,
+                  timeout = 10000) // query timeout = 10 seconds
+    Optional<Fraction> withWriteLock(String name);
+
 }

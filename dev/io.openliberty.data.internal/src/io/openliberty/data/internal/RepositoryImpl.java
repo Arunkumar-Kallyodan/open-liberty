@@ -39,7 +39,6 @@ import com.ibm.websphere.ras.Tr;
 import com.ibm.websphere.ras.TraceComponent;
 import com.ibm.websphere.ras.annotation.Trivial;
 import com.ibm.ws.LocalTransaction.LocalTransactionCoordinator;
-import com.ibm.ws.ffdc.FFDCFilter;
 import com.ibm.ws.ffdc.annotation.FFDCIgnore;
 
 import io.openliberty.data.internal.cdi.DataExtension;
@@ -316,7 +315,9 @@ public class RepositoryImpl<R> implements InvocationHandler {
             if (x == null) {
                 if (original instanceof OptimisticLockException)
                     x = new OptimisticLockingFailureException(original);
-                else if (original instanceof jakarta.persistence.EntityExistsException)
+                else if (original instanceof jakarta.persistence.EntityExistsException ||
+                         "org.hibernate.exception.ConstraintViolationException" //
+                                         .equals(original.getClass().getName()))
                     x = new EntityExistsException(original);
                 else if (original instanceof NoResultException)
                     x = new EmptyResultException(original);
@@ -395,8 +396,10 @@ public class RepositoryImpl<R> implements InvocationHandler {
         Class<?> type = info.method.getReturnType();
 
         if (EntityManager.class.equals(type)) {
-            resource = factory.getEntityManager(stateful);
-            resourceAutoCloses = stateful;
+            EntityHandlerFactory.Sync<EntityManager> emSync = //
+                            factory.getEntityManager(stateful);
+            resource = emSync.entityHandler();
+            resourceAutoCloses = emSync.automaticallyCloses();
         } else if (DataSource.class.equals(type)) {
             resource = factory.getDataSource(info.method, repositoryInterface);
         } else if (Connection.class.equals(type)) {
@@ -407,7 +410,10 @@ public class RepositoryImpl<R> implements InvocationHandler {
                 throw new DataConnectionException(x);
             }
         } else if ("jakarta.persistence.EntityAgent".equals(type.getName())) {
-            resource = factory.getEntityAgent();
+            EntityHandlerFactory.Sync<AutoCloseable> agentSync = //
+                            factory.getEntityAgent();
+            resource = agentSync.entityHandler();
+            resourceAutoCloses = agentSync.automaticallyCloses();
         }
 
         if (resource == null)
@@ -419,7 +425,7 @@ public class RepositoryImpl<R> implements InvocationHandler {
                       Util.names(provider.compat.resourceAccessorTypes(stateful)));
 
         if (!resourceAutoCloses &&
-            resource instanceof AutoCloseable) {
+            resource instanceof AutoCloseable closeable) {
             Deque<AutoCloseable> resources = defaultMethodResources.get();
             if (resources == null) {
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
@@ -439,7 +445,7 @@ public class RepositoryImpl<R> implements InvocationHandler {
                              (Object[]) shortened);
                 }
             } else {
-                resources.add((AutoCloseable) resource);
+                resources.add(closeable);
             }
         }
 
@@ -512,46 +518,18 @@ public class RepositoryImpl<R> implements InvocationHandler {
 
         // EntityManager and EntityAgent inherit from AutoCloseable
         // via their common superclass, EntityHandler:
-        AutoCloseable eh = null;
+        EntityHandlerFactory.Sync<? extends AutoCloseable> ehSync = null;
         try {
             if (isDisposed.get())
-                throw exc(IllegalStateException.class,
-                          "CWWKD1076.repo.disposed",
-                          method.getName(),
-                          repositoryInterface.getName(),
-                          new StringBuilder("RepositoryImpl@") //
-                                          .append(Integer.toHexString(hashCode())) //
-                                          .append("/(proxy)@") //
-                                          .append(Integer.toHexString(System.identityHashCode(proxy))));
+                throw Fail.disposed(this, proxy, method);
 
             if (isDefaultMethod) {
-                Deque<AutoCloseable> resourceStack = defaultMethodResources.get();
-                boolean added;
-                if (added = (resourceStack == null))
-                    defaultMethodResources.set(resourceStack = new LinkedList<>());
-                else
-                    resourceStack.add(null); // indicator of nested default method
-                try {
-                    Object returnValue = InvocationHandler.invokeDefault(proxy, method, args);
-                    if (trace && tc.isEntryEnabled())
-                        Tr.exit(this, tc, "invoke " + repositoryInterface.getSimpleName() +
-                                          '.' + method.getName(),
-                                returnValue);
-                    return returnValue;
-                } finally {
-                    for (AutoCloseable resource; (resource = resourceStack.pollLast()) != null;)
-                        if (!(resource instanceof EntityManager) ||
-                            ((EntityManager) resource).isOpen())
-                            try {
-                                if (trace && tc.isDebugEnabled())
-                                    Tr.debug(this, tc, "close " + resource);
-                                resource.close();
-                            } catch (Throwable x) {
-                                FFDCFilter.processException(x, getClass().getName(), "1827", this);
-                            }
-                    if (added)
-                        defaultMethodResources.remove();
-                }
+                Object returnValue = invokeDefaultMethod(proxy, method, args);
+                if (trace && tc.isEntryEnabled())
+                    Tr.exit(this, tc, "invoke " + repositoryInterface.getSimpleName() +
+                                      '.' + method.getName(),
+                            provider.loggable(repositoryInterface, method, returnValue));
+                return returnValue;
             }
 
             Object returnValue;
@@ -586,10 +564,15 @@ public class RepositoryImpl<R> implements InvocationHandler {
                     Tr.debug(this, tc, Util.txStatusToString(txStatus));
                 }
 
-                if (queryType != RESOURCE_ACCESS)
-                    eh = stateful || queryInfo.entityInfo.simulateStateless() //
+                AutoCloseable eh;
+                if (queryType == RESOURCE_ACCESS) {
+                    eh = null;
+                } else {
+                    ehSync = stateful || queryInfo.entityInfo.simulateStateless() //
                                     ? factory.getEntityManager(stateful) //
                                     : factory.getEntityAgent();
+                    eh = ehSync.entityHandler();
+                }
 
                 returnValue = switch (queryType) {
                     case FIND, FIND_AND_DELETE -> queryInfo.find(eh, txStatus, args);
@@ -630,7 +613,7 @@ public class RepositoryImpl<R> implements InvocationHandler {
                             provider.tranMgr.commit();
                         }
                     } else {
-                        boolean detach = eh != null &&
+                        boolean detach = ehSync != null &&
                                          queryType.detachEntities(stateful);
                         if (Status.STATUS_ACTIVE == provider.tranMgr.getStatus()) {
                             if (failed) {
@@ -638,7 +621,7 @@ public class RepositoryImpl<R> implements InvocationHandler {
                                     Tr.debug(this, tc, "set rollback only");
                                 provider.tranMgr.setRollbackOnly();
                             } else if (detach &&
-                                       eh instanceof EntityManager em) {
+                                       ehSync.entityHandler() instanceof EntityManager em) {
                                 // flush changes first because detach interferes with updates
                                 if (trace && tc.isDebugEnabled())
                                     Tr.debug(this, tc, "flush");
@@ -648,7 +631,7 @@ public class RepositoryImpl<R> implements InvocationHandler {
                                 em.clear();
                             }
                         } else if (detach &&
-                                   eh instanceof EntityManager em) {
+                                   ehSync.entityHandler() instanceof EntityManager em) {
                             if (trace && tc.isDebugEnabled())
                                 Tr.debug(this, tc, "clear");
                             em.clear();
@@ -662,8 +645,8 @@ public class RepositoryImpl<R> implements InvocationHandler {
                             provider.localTranCurrent.resume(suspendedLTC);
                         }
                     } finally {
-                        if (!stateful && eh != null)
-                            eh.close();
+                        if (ehSync != null && !ehSync.automaticallyCloses())
+                            ehSync.entityHandler().close();
                     }
                 }
             }
@@ -688,4 +671,39 @@ public class RepositoryImpl<R> implements InvocationHandler {
         }
     }
 
+    /**
+     * Invokes a default method on a repository.
+     *
+     * @param proxy  instance upon which the application invoked the default method
+     * @param method the default method
+     * @param args   arguments to the default method
+     * @return the result of the default method
+     * @throws Throwable if thrown by the default method
+     */
+    @Trivial // avoid tracing customer data
+    private Object invokeDefaultMethod(Object proxy, Method method, Object... args) //
+                    throws Throwable {
+        Deque<AutoCloseable> resourceStack = defaultMethodResources.get();
+        boolean added;
+        if (added = (resourceStack == null))
+            defaultMethodResources.set(resourceStack = new LinkedList<>());
+        else
+            resourceStack.add(null); // indicator of nested default method
+        try {
+            return InvocationHandler.invokeDefault(proxy, method, args);
+        } finally {
+            for (AutoCloseable resource; (resource = resourceStack.pollLast()) != null;)
+                if (!(resource instanceof EntityManager) ||
+                    ((EntityManager) resource).isOpen())
+                    try {
+                        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
+                            Tr.debug(this, tc, "close " + resource);
+                        resource.close();
+                    } catch (Throwable x) {
+                        // auto FFDC
+                    }
+            if (added)
+                defaultMethodResources.remove();
+        }
+    }
 }
